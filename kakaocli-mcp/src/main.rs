@@ -5,9 +5,13 @@
 //! its output, so all platform logic (Windows DEK scan, macOS AX, schema
 //! dispatch) is reused verbatim — one source of truth.
 //!
-//! Safety: the `send` tool only delivers when `confirm: true` is passed;
-//! otherwise it runs `--dry-run` (preview). It never shells an interactive
-//! prompt (always `--yes` on a confirmed send) so it can't hang headless.
+//! READ-ONLY BUILD: the `send` tool has been removed. This server can only
+//! read chats; it has no way to send a message.
+//!
+//! KEY CACHE: kakaocli caches decryption keys in plain text at
+//! %TEMP%\kakaocli\dek_cache.json and reuses it even after new chats are
+//! opened. This build deletes that file before each call (so newly opened
+//! chats are picked up) and after each call (so keys are not left on disk).
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -136,20 +140,6 @@ fn tool_specs() -> Value {
             "name": "check",
             "description": "앱/권한/DB 상태를 점검한다.",
             "inputSchema": { "type": "object", "properties": {} }
-        },
-        {
-            "name": "send",
-            "description": "메시지를 전송한다. 안전을 위해 confirm=true 일 때만 실제 전송하고, 그 외에는 미리보기(dry-run)만 수행한다.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "chat": { "type": "string", "description": "채팅방 이름. me=true면 생략" },
-                    "me": { "type": "boolean", "description": "나와의 채팅으로 전송" },
-                    "message": { "type": "string" },
-                    "confirm": { "type": "boolean", "description": "true여야 실제 전송. 기본 false(미리보기)" }
-                },
-                "required": ["message"]
-            }
         }
     ])
 }
@@ -244,23 +234,6 @@ fn build_argv(name: &str, args: &Value) -> Result<Vec<String>, String> {
             a.push("check".into());
             a.push("--json".into());
         }
-        "send" => {
-            let msg = s("message").ok_or("message가 필요합니다")?;
-            a.push("send".into());
-            if b("me") {
-                a.push("--me".into());
-            } else if let Some(c) = s("chat") {
-                a.push(c);
-            } else {
-                return Err("chat 또는 me가 필요합니다".into());
-            }
-            a.push(msg);
-            if b("confirm") {
-                a.push("--yes".into()); // 실제 전송 (비대화형)
-            } else {
-                a.push("--dry-run".into()); // 기본: 미리보기만
-            }
-        }
         other => return Err(format!("알 수 없는 도구: {other}")),
     }
     Ok(a)
@@ -287,10 +260,12 @@ fn kakaocli_path() -> std::path::PathBuf {
 /// Run kakaocli. `Ok` on zero exit (success), `Err` on non-zero so the caller
 /// marks the tool result `isError: true` instead of reporting failure as success.
 fn run_kakaocli(argv: &[String]) -> Result<String, String> {
-    let output = std::process::Command::new(kakaocli_path())
+    clear_dek_cache(); // fresh scan: picks up chats opened since the last call
+    let result = std::process::Command::new(kakaocli_path())
         .args(argv)
-        .output()
-        .map_err(|e| e.to_string())?;
+        .output();
+    clear_dek_cache(); // don't leave plaintext keys in %TEMP%
+    let output = result.map_err(|e| e.to_string())?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     if output.status.success() {
         return Ok(stdout);
@@ -310,30 +285,29 @@ fn run_kakaocli(argv: &[String]) -> Result<String, String> {
     Err(msg)
 }
 
+/// kakaocli's DEK cache file (same path kakaocli uses: temp_dir/kakaocli).
+fn dek_cache_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("kakaocli").join("dek_cache.json")
+}
+
+/// Delete the plaintext DEK cache. Missing file is fine.
+fn clear_dek_cache() {
+    let _ = std::fs::remove_file(dek_cache_path());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
     #[test]
-    fn send_defaults_to_dry_run() {
-        let a = build_argv("send", &json!({ "chat": "짱정하", "message": "hi" })).unwrap();
-        assert_eq!(a, vec!["send", "짱정하", "hi", "--dry-run"]);
-    }
-
-    #[test]
-    fn send_confirm_true_actually_sends_noninteractive() {
-        let a = build_argv(
-            "send",
-            &json!({ "me": true, "message": "hi", "confirm": true }),
-        )
-        .unwrap();
-        assert_eq!(a, vec!["send", "--me", "hi", "--yes"]);
-    }
-
-    #[test]
-    fn send_requires_target() {
-        assert!(build_argv("send", &json!({ "message": "hi" })).is_err());
+    fn clear_dek_cache_removes_file() {
+        let p = dek_cache_path();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "{}").unwrap();
+        clear_dek_cache();
+        assert!(!p.exists());
+        clear_dek_cache(); // missing file must not panic
     }
 
     #[test]
@@ -359,5 +333,15 @@ mod tests {
         assert!(build_argv("messages", &json!({ "limit": 10 })).is_err());
         assert!(build_argv("messages", &json!({ "chat": "x" })).is_ok());
         assert!(build_argv("messages", &json!({ "me": true })).is_ok());
+    }
+
+    #[test]
+    fn send_tool_is_removed() {
+        assert!(build_argv(
+            "send",
+            &json!({ "chat": "x", "message": "hi", "confirm": true })
+        )
+        .is_err());
+        assert!(!tool_specs().to_string().contains("\"send\""));
     }
 }
