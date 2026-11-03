@@ -12,11 +12,24 @@
 //! %TEMP%\kakaocli\dek_cache.json and reuses it even after new chats are
 //! opened. This build deletes that file before each call (so newly opened
 //! chats are picked up) and after each call (so keys are not left on disk).
+//!
+//! EXCLUDED CHATS: results from the chat IDs in `EXCLUDED_CHAT_IDS` (plus any
+//! IDs listed in `excluded_chats.txt` next to this exe, one per line) are
+//! removed before anything is returned to the AI. If a result can't be parsed
+//! for filtering, nothing is returned (fail closed).
 
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::{BufRead, Write};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Chats whose content must never reach the AI.
+/// 18374231911657749 = "오스틴 텍사스 한인 최대 챗방" (open community chat).
+const EXCLUDED_CHAT_IDS: &[i64] = &[18374231911657749];
+
+/// Optional extra exclusions: `excluded_chats.txt` beside this exe.
+const EXCLUDE_FILE: &str = "excluded_chats.txt";
 
 fn main() {
     let stdin = std::io::stdin();
@@ -160,10 +173,115 @@ fn handle_tool_call(id: Value, params: Option<&Value>) -> Value {
         Err(e) => return tool_result(id, e, true),
     };
 
-    match run_kakaocli(&argv) {
-        Ok(out) => tool_result(id, out, false),
-        Err(e) => tool_result(id, format!("kakaocli 실행 실패: {e}"), true),
+    let out = match run_kakaocli(&argv) {
+        Ok(out) => out,
+        Err(e) => return tool_result(id, format!("kakaocli 실행 실패: {e}"), true),
+    };
+    match filter_output(name, &args, &out, &excluded_ids()) {
+        Ok(text) => tool_result(id, text, false),
+        Err(e) => tool_result(id, e, true),
     }
+}
+
+/// Built-in exclusions plus any IDs in `excluded_chats.txt` beside the exe.
+fn excluded_ids() -> HashSet<i64> {
+    let mut set: HashSet<i64> = EXCLUDED_CHAT_IDS.iter().copied().collect();
+    if let Ok(cur) = std::env::current_exe() {
+        if let Some(dir) = cur.parent() {
+            if let Ok(text) = std::fs::read_to_string(dir.join(EXCLUDE_FILE)) {
+                set.extend(parse_exclude_file(&text));
+            }
+        }
+    }
+    set
+}
+
+/// One chat ID per line; anything after `#` is a comment.
+fn parse_exclude_file(text: &str) -> Vec<i64> {
+    text.lines()
+        .filter_map(|l| l.split('#').next())
+        .filter_map(|l| l.trim().parse::<i64>().ok())
+        .collect()
+}
+
+const FILTER_FAIL: &str =
+    "결과를 확인할 수 없어 표시하지 않습니다 (제외 채팅방 보호). kakaocli를 직접 실행해 확인하세요.";
+const EXCLUDED_ONLY: &str =
+    "이 채팅방은 제외 목록에 있어 읽을 수 없습니다. 다른 방을 찾으시면 더 정확한 이름으로 다시 시도하세요.";
+
+/// Remove anything belonging to an excluded chat. Fails closed: if the output
+/// isn't the JSON shape we expect, return an error instead of the raw text.
+fn filter_output(
+    name: &str,
+    args: &Value,
+    out: &str,
+    excluded: &HashSet<i64>,
+) -> Result<String, String> {
+    if name == "check" {
+        return Ok(out.to_string()); // status only, no chat content
+    }
+    let mut v: Value = serde_json::from_str(out).map_err(|_| FILTER_FAIL.to_string())?;
+    let flag = |k: &str| args.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+    let is_excluded = |x: Option<&Value>| {
+        x.and_then(|n| n.as_i64())
+            .map(|n| excluded.contains(&n))
+            .unwrap_or(false)
+    };
+
+    match name {
+        // Chat lists: the chat's own id is "id".
+        "chats" => retain_array(&mut v, |e| !is_excluded(e.get("id")))?,
+        "find" if flag("rooms") => retain_array(&mut v, |e| !is_excluded(e.get("id")))?,
+        // Friend search returns contacts only (no chat content).
+        "find" if flag("friends") => {}
+        // Messages: each carries "chat_id".
+        "find" => retain_array(&mut v, |e| !is_excluded(e.get("chat_id")))?,
+        "messages" => {
+            let before = v.as_array().map(|a| a.len()).ok_or(FILTER_FAIL)?;
+            retain_array(&mut v, |e| !is_excluded(e.get("chat_id")))?;
+            let after = v.as_array().map(|a| a.len()).unwrap_or(0);
+            if before > 0 && after == 0 {
+                return Err(EXCLUDED_ONLY.to_string());
+            }
+        }
+        "stats" => {
+            let top = args
+                .get("top")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(20)
+                .min(1000) as usize;
+            let rooms = v
+                .get_mut("by_room")
+                .and_then(|r| r.as_array_mut())
+                .ok_or(FILTER_FAIL)?;
+            let mut removed = 0i64;
+            rooms.retain(|r| {
+                if is_excluded(r.get("chat_id")) {
+                    removed += r.get("count").and_then(|c| c.as_i64()).unwrap_or(0);
+                    false
+                } else {
+                    true
+                }
+            });
+            rooms.truncate(top);
+            if removed > 0 {
+                if let Some(t) = v.get("total").and_then(|t| t.as_i64()) {
+                    v["total"] = json!(t - removed);
+                }
+                v["excluded_note"] = json!(
+                    "제외 채팅방은 by_room과 total에서 뺐습니다. by_date/by_hour 건수에는 포함돼 있을 수 있습니다."
+                );
+            }
+        }
+        _ => return Err(FILTER_FAIL.to_string()),
+    }
+    serde_json::to_string_pretty(&v).map_err(|_| FILTER_FAIL.to_string())
+}
+
+fn retain_array(v: &mut Value, keep: impl Fn(&Value) -> bool) -> Result<(), String> {
+    let arr = v.as_array_mut().ok_or(FILTER_FAIL)?;
+    arr.retain(|e| keep(e));
+    Ok(())
 }
 
 /// Translate a tool call into kakaocli argv. Read tools always append `--json`.
@@ -224,10 +342,10 @@ fn build_argv(name: &str, args: &Value) -> Result<Vec<String>, String> {
                 a.push("--since".into());
                 a.push(since);
             }
-            if let Some(n) = i("top") {
-                a.push("--top".into());
-                a.push(n.to_string());
-            }
+            // Ask for every room so excluded chats can be removed exactly;
+            // the requested `top` is applied after filtering.
+            a.push("--top".into());
+            a.push("9999".into());
             a.push("--json".into());
         }
         "check" => {
@@ -333,6 +451,100 @@ mod tests {
         assert!(build_argv("messages", &json!({ "limit": 10 })).is_err());
         assert!(build_argv("messages", &json!({ "chat": "x" })).is_ok());
         assert!(build_argv("messages", &json!({ "me": true })).is_ok());
+    }
+
+    const COMMUNITY: i64 = 18374231911657749;
+
+    fn ex() -> HashSet<i64> {
+        EXCLUDED_CHAT_IDS.iter().copied().collect()
+    }
+
+    #[test]
+    fn chats_hides_community_chat() {
+        let out = json!([{ "id": 1, "display_name": "client" },
+                         { "id": COMMUNITY, "display_name": "오스틴 텍사스 한인 최대 챗방" }])
+        .to_string();
+        let r = filter_output("chats", &json!({}), &out, &ex()).unwrap();
+        assert!(r.contains("client"));
+        assert!(!r.contains("최대 챗방") && !r.contains(&COMMUNITY.to_string()));
+    }
+
+    #[test]
+    fn messages_from_community_chat_are_refused() {
+        let out = json!([{ "id": 9, "chat_id": COMMUNITY, "text": "secret" }]).to_string();
+        let r = filter_output("messages", &json!({ "chat": "오스틴" }), &out, &ex());
+        assert!(r.is_err());
+        assert!(!r.unwrap_err().contains("secret"));
+    }
+
+    #[test]
+    fn messages_from_client_chat_pass() {
+        let out = json!([{ "id": 9, "chat_id": 5, "text": "hello" }]).to_string();
+        let r = filter_output("messages", &json!({ "chat": "x" }), &out, &ex()).unwrap();
+        assert!(r.contains("hello"));
+    }
+
+    #[test]
+    fn find_drops_community_messages_and_rooms() {
+        let msgs = json!([{ "id": 1, "chat_id": COMMUNITY, "text": "a" },
+                          { "id": 2, "chat_id": 5, "text": "b" }])
+        .to_string();
+        let r = filter_output("find", &json!({ "keyword": "x" }), &msgs, &ex()).unwrap();
+        assert!(r.contains("\"b\"") && !r.contains("\"a\""));
+        let rooms = json!([{ "id": COMMUNITY, "display_name": "최대 챗방" }]).to_string();
+        let r = filter_output(
+            "find",
+            &json!({ "keyword": "챗방", "rooms": true }),
+            &rooms,
+            &ex(),
+        )
+        .unwrap();
+        assert!(!r.contains("최대 챗방"));
+    }
+
+    #[test]
+    fn stats_removes_community_and_applies_top() {
+        let out = json!({
+            "total": 1000,
+            "by_room": [
+                { "chat_id": COMMUNITY, "name": "최대 챗방", "count": 900 },
+                { "chat_id": 1, "name": "a", "count": 60 },
+                { "chat_id": 2, "name": "b", "count": 40 }
+            ],
+            "by_date": [], "by_hour": [],
+            "coverage": { "rooms_counted": 3, "rooms_total": 3, "partial": false }
+        })
+        .to_string();
+        let r = filter_output("stats", &json!({ "top": 1 }), &out, &ex()).unwrap();
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["total"], 100);
+        assert_eq!(v["by_room"].as_array().unwrap().len(), 1);
+        assert_eq!(v["by_room"][0]["name"], "a");
+        assert!(!r.contains("최대 챗방"));
+    }
+
+    #[test]
+    fn unparseable_output_fails_closed() {
+        let r = filter_output(
+            "messages",
+            &json!({ "chat": "x" }),
+            "not json secret",
+            &ex(),
+        );
+        assert!(r.is_err());
+        assert!(!r.unwrap_err().contains("secret"));
+    }
+
+    #[test]
+    fn exclude_file_parsing() {
+        let ids = parse_exclude_file("# comment\n123\n 456  # note\nabc\n\n");
+        assert_eq!(ids, vec![123, 456]);
+    }
+
+    #[test]
+    fn stats_always_requests_all_rooms() {
+        let a = build_argv("stats", &json!({ "since": "7d", "top": 5 })).unwrap();
+        assert_eq!(a, vec!["stats", "--since", "7d", "--top", "9999", "--json"]);
     }
 
     #[test]
